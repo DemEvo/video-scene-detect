@@ -2,27 +2,14 @@ import cv2
 import os
 import argparse
 import yt_dlp
-from scenedetect import open_video, SceneManager, ContentDetector
+import io
 import img2pdf
-import glob
 import ocrmypdf
+from PIL import Image
+from scenedetect import open_video, SceneManager, ContentDetector
 
-def create_pdf_from_frames(output_dir, pdf_path):
-    # Ищем все .jpg файлы в папке и сортируем их по имени (scene_001_01.jpg и т.д.)
-    search_pattern = os.path.join(output_dir, '*.jpg')
-    image_files = sorted(glob.glob(search_pattern))
-
-    if not image_files:
-        print(f"В папке '{output_dir}' не найдено изображений для создания PDF.")
-        return
-
-    print(f"Сборка PDF из {len(image_files)} кадров...")
-
-    # Конвертируем список картинок в PDF
-    with open(pdf_path, "wb") as f:
-        f.write(img2pdf.convert(image_files))
-
-    print(f"Готово! PDF сохранен как: {pdf_path}")
+THRESHOLD = 21.0
+MIN_SCENE_LEN = 10
 
 
 def download_youtube_video(url, output_dir):
@@ -56,8 +43,15 @@ def extract_scene_frames(video_path, output_dir, num_frames):
 
     video = open_video(video_path)
     scene_manager = SceneManager()
-    scene_manager.add_detector(ContentDetector(threshold=41.0))
-    scene_manager.detect_scenes(video)
+
+    # 1. ОТКЛЮЧАЕМ АВТОМАТИКУ
+    scene_manager.auto_downscale = False
+    # 2. Ускорение: Включаем сильное уменьшение картинки перед анализом
+    scene_manager.downscale = 8  # Работает в десятки раз быстрее
+    # 3. Оптимизация детектора:
+    scene_manager.add_detector(ContentDetector(threshold=THRESHOLD, min_scene_len=MIN_SCENE_LEN))
+    # 4. Ускорение: Заставляем SceneManager пропускать кадры при чтении
+    scene_manager.detect_scenes(video, frame_skip=2)
 
     scene_list = scene_manager.get_scene_list()
     if not scene_list:
@@ -71,6 +65,7 @@ def extract_scene_frames(video_path, output_dir, num_frames):
     os.makedirs(output_dir, exist_ok=True)
 
     extracted_count = 0
+    frames_in_memory = []
 
     for i, (start_time, end_time) in enumerate(scene_list):
         scene_num = i + 1
@@ -81,56 +76,112 @@ def extract_scene_frames(video_path, output_dir, num_frames):
 
         frames_to_extract = []
 
+        # Нам нужно отступить на 3 кадра от end_frame, чтобы избежать
+        # возможного черного экрана (fade out) перед самой склейкой
+        last_frame_of_scene = max(start_frame, end_frame - 3)
+
         if num_frames == 1:
+            # Если нужен только 1 кадр — берем середину
             frames_to_extract.append(start_frame + length // 2)
+
+        elif num_frames == 2:
+            # Если 2 кадра — берем строго начало и самый конец сцены
+            frames_to_extract.append(start_frame)
+            frames_to_extract.append(last_frame_of_scene)
+
         else:
-            step = length // num_frames
-            for j in range(num_frames):
-                frame_idx = start_frame + j * step
-                frame_idx = min(frame_idx, end_frame - 1)
-                frames_to_extract.append(frame_idx)
+            # Если 3 и более кадров — берем начало, конец и равномерно между ними
+            frames_to_extract.append(start_frame)
 
-                # Сохранение кадров с наложением таймкода
-                for j, frame_idx in enumerate(frames_to_extract):
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-                    ret, frame = cap.read()
-                    if ret:
-                        # 1. Вычисляем таймкод (часы, минуты, секунды)
-                        time_in_seconds = frame_idx / fps
-                        mins, secs = divmod(time_in_seconds, 60)
-                        hours, mins = divmod(mins, 60)
+            # Считаем шаг для промежуточных кадров
+            # Делим на (num_frames - 1), чтобы последний кадр точно попал в конец отрезка
+            step = length / (num_frames - 1)
 
-                        # Формируем строку: Сцена N | HH:MM:SS.мс
-                        time_str = f"Scene {scene_num} | {int(hours):02d}:{int(mins):02d}:{secs:05.2f}"
+            for j in range(1, num_frames - 1):
+                # Округляем до целого числа кадров
+                middle_idx = int(start_frame + j * step)
+                frames_to_extract.append(middle_idx)
 
-                        # 2. Настройки шрифта
-                        font = cv2.FONT_HERSHEY_SIMPLEX
-                        position = (30, 60)  # Отступ сверху и слева
-                        font_scale = 0.8  # Размер шрифта (увеличьте, если видео 4K)
-                        thickness = 2
+            frames_to_extract.append(last_frame_of_scene)
 
-                        # 3. Рисуем черную обводку (чтобы текст читался на светлом фоне)
-                        cv2.putText(frame, time_str, position, font, font_scale, (0, 0, 0), thickness + 3)
-                        # 4. Рисуем сам белый текст поверх обводки
-                        cv2.putText(frame, time_str, position, font, font_scale, (255, 255, 255), thickness)
+        # Удаляем возможные дубликаты индексов (если сцена очень короткая)
+        # и сортируем по порядку воспроизведения
+        frames_to_extract = sorted(list(set(frames_to_extract)))
 
-                        # 5. Сохраняем картинку
-                        filename = os.path.join(output_dir, f'scene_{scene_num:03d}_{j + 1:02d}.jpg')
-                        cv2.imwrite(filename, frame)
-                        extracted_count += 1
+        # Обработка кадров в оперативной памяти
+        for j, frame_idx in enumerate(frames_to_extract):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+
+            if ret:
+                # 1. Накладываем таймкод
+                time_in_seconds = frame_idx / fps
+                mins, secs = divmod(time_in_seconds, 60)
+                hours, mins = divmod(mins, 60)
+                time_str = f"Scene_{scene_num} {int(hours):01d}:{int(mins):02d}:{secs:05.2f}"
+
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                cv2.putText(frame, time_str, (30, 60), font, 1.5, (250, 250, 200), 70)
+                cv2.putText(frame, time_str, (30, 60), font, 1.5, (10, 10, 10), 3)
+
+                # 2. Кодируем кадр в JPEG прямо в оперативной памяти
+                # cv2.imencode возвращает кортеж: (статус, массив байтов)
+                ret_encode, buffer = cv2.imencode('.jpg', frame)
+                if ret_encode:
+                    # buffer.tobytes() превращает массив numpy в сырые байты картинки
+                    frames_in_memory.append(buffer.tobytes())
+
+                extracted_count += 1
 
     cap.release()
-    print(f"Успешно завершено! Сохранено {extracted_count} изображений в папку '{output_dir}'.")
+    print(f"Успешно извлечено {extracted_count} кадров в оперативную память.")
+
+    # --- СБОРКА PDF И РАСПОЗНАВАНИЕ ТЕКСТА ---
+    if frames_in_memory:
+        # Извлекаем чистое имя файла из пути (например, "video_name.mp4" -> "video_name")
+        file_name_with_ext = os.path.basename(video_path)
+        base_name, _ = os.path.splitext(file_name_with_ext)
+
+        final_pdf_path = os.path.join(output_dir, f"{base_name}.pdf")
+
+        print(f"Сборка чернового PDF из {len(frames_in_memory)} кадров в памяти...")
+
+        # 1. Собираем PDF в оперативной памяти (передаем напрямую список байтов от cv2)
+        raw_pdf_bytes = img2pdf.convert(frames_in_memory)
+
+        # 2. Передаем виртуальный файл в OCRmyPDF
+        print(f"Запускаю OCR (ocrmypdf)... Это займет некоторое время.")
+
+        # Оборачиваем сырые байты в виртуальный файл (BytesIO), который ocrmypdf сможет прочитать
+        pdf_input_stream = io.BytesIO(raw_pdf_bytes)
+
+        try:
+            # Вызываем OCRmyPDF
+            ocrmypdf.ocr(
+                pdf_input_stream,
+                final_pdf_path,
+                language='eng',
+                force_ocr=True,
+                progress_bar=False
+            )
+            print(f"Готово! Финальный PDF с текстом сохранен как: {final_pdf_path}")
+        except Exception as e:
+            print(f"Ошибка при создании OCR PDF: {e}")
+
+            # Если OCR сломался, сохраняем черновой PDF на диск
+            raw_pdf_path = os.path.join(output_dir, f"{base_name}_raw.pdf")
+            with open(raw_pdf_path, "wb") as f:
+                f.write(raw_pdf_bytes)
+            print(f"Черновой PDF без поиска сохранен как: {raw_pdf_path}")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Скачивание с YouTube и извлечение ключевых кадров.")
+    parser = argparse.ArgumentParser(description="Скачивание с YouTube и извлечение ключевых кадров в GIF.")
     parser.add_argument("source", help="Путь к локальному видеофайлу ИЛИ ссылка на YouTube")
     parser.add_argument("-o", "--output", default="frames", help="Папка для сохранения (по умолчанию: 'frames')")
     parser.add_argument("-n", "--num-frames", type=int, default=2, help="Количество кадров на сцену (по умолчанию: 2)")
 
     args = parser.parse_args()
-
     input_source = args.source
 
     # Проверяем, является ли источник ссылкой
@@ -144,22 +195,5 @@ if __name__ == '__main__':
     else:
         video_path = input_source
 
-    # Запускаем извлечение кадров
+    # Запускаем извлечение кадров и сборку
     extract_scene_frames(video_path, args.output, args.num_frames)
-
-    # Формируем имя для PDF-файла (например, frames/storyboard.pdf)
-    pdf_filename = os.path.join(args.output, "storyboard.pdf")
-
-    # Запускаем сборку PDF
-    create_pdf_from_frames(args.output, pdf_filename)
-
-    # Создаем финальный файл с текстовым слоем
-    searchable_pdf = os.path.join(args.output, "storyboard_searchable.pdf")
-    print("Запуск распознавания текста (OCR)... Это может занять некоторое время.")
-
-    try:
-        # force_ocr=True заставляет движок распознавать текст даже на картинках
-        ocrmypdf.ocr(pdf_filename, searchable_pdf, language="rus+eng", force_ocr=True)
-        print(f"Готово! PDF с возможностью поиска сохранен как: {searchable_pdf}")
-    except Exception as e:
-        print(f"Ошибка при создании OCR PDF: {e}")

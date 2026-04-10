@@ -10,6 +10,9 @@ from langdetect import detect_langs, DetectorFactory
 from scenedetect import open_video, SceneManager, ContentDetector
 from rapidfuzz import process, fuzz
 
+THRESHOLD = 46.0
+MIN_SCENE_LEN = 15
+SIMILARITY_SCORE = 50.0
 # Фиксируем seed для langdetect, чтобы результаты были воспроизводимы
 DetectorFactory.seed = 0
 
@@ -101,7 +104,7 @@ def process_video_to_smart_pdf(video_path, output_dir, num_frames=2):
 
     # 3. Оптимизация детектора:
     # min_scene_len=15 защищает от ложных склеек при моргании света
-    scene_manager.add_detector(ContentDetector(threshold=46.0, min_scene_len=15))
+    scene_manager.add_detector(ContentDetector(threshold=THRESHOLD, min_scene_len=MIN_SCENE_LEN))
 
     # 4. Ускорение: Заставляем SceneManager пропускать кадры при чтении
     # frame_skip=2 означает, что мы анализируем только каждый 3-й кадр (ускорение в 3 раза)
@@ -191,7 +194,7 @@ def process_video_to_smart_pdf(video_path, output_dir, num_frames=2):
                 if best_match:
                     similarity_score = best_match[1]
                     # Если текст похож на любой из предыдущих на 85% и более
-                    if similarity_score >= 50.0:
+                    if similarity_score >= SIMILARITY_SCORE:
                         print(
                             f"Сцена {scene_num} | Кадр {j + 1}: Текст уже был ранее (сходство {similarity_score:.1f}%). Дубликат отброшен.")
                         continue
@@ -209,11 +212,11 @@ def process_video_to_smart_pdf(video_path, output_dir, num_frames=2):
             time_in_seconds = frame_idx / fps
             mins, secs = divmod(time_in_seconds, 60)
             hours, mins = divmod(mins, 60)
-            time_str = f"Scene {scene_num} | {int(hours):02d}:{int(mins):02d}:{secs:05.2f}"
+            time_str = f"Scene_{scene_num} {int(hours):01d}:{int(mins):02d}:{secs:05.2f}"
 
             font = cv2.FONT_HERSHEY_SIMPLEX
-            cv2.putText(frame, time_str, (30, 60), font, 1.2, (0, 0, 0), 5)
-            cv2.putText(frame, time_str, (30, 60), font, 1.2, (255, 255, 255), 2)
+            cv2.putText(frame, time_str, (30, 60), font, 1.5, (250, 250, 200), 70)
+            cv2.putText(frame, time_str, (30, 60), font, 1.5, (10, 10, 10), 3)
 
             # 5. Кодируем кадр в JPEG в оперативной памяти
             ret_encode, buffer = cv2.imencode('.jpg', frame)
@@ -236,7 +239,9 @@ def process_video_to_smart_pdf(video_path, output_dir, num_frames=2):
     print(f"\nИзвлечено полезных кадров: {len(frames_in_memory)}.")
     print(f"Итоговые языки для OCR-обработки: {ocr_lang_str}")
 
-    base_name = "smart_storyboard"
+    # Извлекаем чистое имя файла из пути (например, "video_name.mp4" -> "video_name")
+    file_name_with_ext = os.path.basename(video_path)
+    base_name, _ = os.path.splitext(file_name_with_ext)
     raw_pdf_path = os.path.join(output_dir, f"{base_name}_raw.pdf")
     final_pdf_path = os.path.join(output_dir, f"{base_name}.pdf")
 
